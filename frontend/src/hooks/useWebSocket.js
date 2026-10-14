@@ -1,0 +1,196 @@
+/**
+ * File — useWebSocket.js
+ *
+ * Connects to /ws/predictions, auto-reconnects with exponential back-off,
+ * and exposes the latest prediction + connection status to consumers.
+ *
+ * Usage:
+ *   const { prediction, status, connected } = useWebSocket()
+ *
+ * `status`  → "connecting" | "connected" | "reconnecting" | "offline"
+ * `connected` → boolean shorthand
+ * `prediction` → null | { load_level, confidence, scores, session_id }
+ */
+
+import { useState, useEffect, useRef, useCallback } from "react"
+
+// Treat VITE_API_URL as "unset" when it points at localhost — that means the
+// dev is running via the Vite proxy and all traffic (including WebSocket)
+// must stay on the same origin so the proxy can forward it.  Only use the
+// explicit URL for real production deployments (non-localhost host).
+const _apiUrl = import.meta.env.VITE_API_URL
+const _isLocalhost = _apiUrl && /localhost|127\.0\.0\.1/.test(_apiUrl)
+const _effectiveUrl = _isLocalhost ? "" : (_apiUrl || "")
+
+const WS_BASE = _effectiveUrl
+  ? _effectiveUrl.replace(/^http/, "ws")              // production: swap scheme
+  : `${window.location.origin.replace(/^http/, "ws")}` // dev proxy: same origin
+
+const RECONNECT_BASE_MS   = 1_000   // first retry after 1 s
+const RECONNECT_MAX_MS    = 30_000  // cap at 30 s
+const RECONNECT_EXPONENT  = 2       // doubles each attempt
+const HEARTBEAT_TIMEOUT   = 60_000  // consider connection dead if no ping in 60 s
+
+export function useWebSocket(enabled = true) {
+  const [status, setStatus]           = useState("offline")
+  const [prediction, setPrediction]   = useState(null)
+
+  const wsRef             = useRef(null)
+  const retryCountRef     = useRef(0)
+  const retryTimerRef     = useRef(null)
+  const heartbeatTimerRef = useRef(null)
+  const connectTimerRef   = useRef(null)
+  const mountedRef        = useRef(true)
+
+  // ── Heartbeat guard ───────────────────────────────────────────────────────
+  const resetHeartbeatTimer = useCallback(() => {
+    clearTimeout(heartbeatTimerRef.current)
+    heartbeatTimerRef.current = setTimeout(() => {
+      // Server missed too many pings — force reconnect
+      wsRef.current?.close()
+    }, HEARTBEAT_TIMEOUT)
+  }, [])
+
+  // ── Connect ───────────────────────────────────────────────────────────────
+  const connect = useCallback(() => {
+    if (!mountedRef.current) return
+
+    const token = localStorage.getItem("token")
+    if (!token) {
+      setStatus("offline")
+      return
+    }
+
+    const url = `${WS_BASE}/ws/predictions?token=${encodeURIComponent(token)}`
+    setStatus(retryCountRef.current === 0 ? "connecting" : "reconnecting")
+
+    // Guard: if the component unmounted between the scheduling of this call
+    // and now (e.g. React Strict Mode double-invoke, fast page reload),
+    // don't open a socket that will be immediately closed.
+    if (!mountedRef.current) return
+
+    const ws = new WebSocket(url)
+    wsRef.current = ws
+
+    // If the handshake hangs (e.g. dev server not proxying /ws) the browser would
+    // stay in "connecting" forever. Give up after 8 s so the UI can show the
+    // problem and retry with back-off.
+    clearTimeout(connectTimerRef.current)
+    connectTimerRef.current = setTimeout(() => {
+      console.warn(`[CogniLoad] WebSocket did not connect within 8s: ${WS_BASE}/ws/predictions`)
+      ws.close()
+    }, 8_000)
+
+    ws.onopen = () => {
+      if (!mountedRef.current) { ws.close(); return }
+      // Don't set "connected" yet — wait for server's {"type":"connected"} frame
+      retryCountRef.current = 0
+      resetHeartbeatTimer()
+    }
+
+    ws.onmessage = (event) => {
+      if (!mountedRef.current) return
+      try {
+        const msg = JSON.parse(event.data)
+
+        switch (msg.type) {
+          case "connected":
+            clearTimeout(connectTimerRef.current)
+            setStatus("connected")
+            resetHeartbeatTimer()
+            break
+
+          case "ping":
+            resetHeartbeatTimer()
+            // Reply with pong
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: "pong" }))
+            }
+            break
+
+          case "prediction":
+            setPrediction({
+              load_level: msg.load_level,
+              confidence: msg.confidence,
+              scores:     msg.scores,
+              session_id: msg.session_id,
+              typing_wpm: msg.typing_wpm,
+              keys_pressed: msg.keys_pressed,
+              mouse_events: msg.mouse_events,
+            })
+            break
+
+          default:
+            break
+        }
+      } catch {
+        // Malformed frame — ignore
+      }
+    }
+
+    ws.onerror = () => {
+      // onerror always followed by onclose — nothing extra needed here
+    }
+
+    ws.onclose = (event) => {
+      clearTimeout(connectTimerRef.current)
+      clearTimeout(heartbeatTimerRef.current)
+      if (!mountedRef.current) return
+
+      // 4001 = auth failure — don't retry
+      if (event.code === 4001) {
+        setStatus("offline")
+        return
+      }
+
+      // Exponential back-off
+      const delay = Math.min(
+        RECONNECT_BASE_MS * RECONNECT_EXPONENT ** retryCountRef.current,
+        RECONNECT_MAX_MS
+      )
+      retryCountRef.current += 1
+      setStatus("reconnecting")
+      retryTimerRef.current = setTimeout(connect, delay)
+    }
+  }, [resetHeartbeatTimer])
+
+  // ── Disconnect helper (exported for explicit close) ───────────────────────
+  const disconnect = useCallback(() => {
+    clearTimeout(retryTimerRef.current)
+    clearTimeout(heartbeatTimerRef.current)
+    wsRef.current?.close()
+    setStatus("offline")
+  }, [])
+
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
+  useEffect(() => {
+    mountedRef.current = true
+
+    // Defer the initial connection by one tick so that React Strict Mode's
+    // double-invoke of effects (mount → unmount → remount) doesn't open a
+    // WebSocket that is immediately closed, causing the console warning
+    // "WebSocket is closed before the connection is established."
+    let initTimer = null
+    if (enabled) {
+      initTimer = setTimeout(() => {
+        if (mountedRef.current) connect()
+      }, 0)
+    }
+
+    return () => {
+      mountedRef.current = false
+      clearTimeout(initTimer)
+      clearTimeout(retryTimerRef.current)
+      clearTimeout(heartbeatTimerRef.current)
+      clearTimeout(connectTimerRef.current)
+      wsRef.current?.close()
+    }
+  }, [enabled, connect])
+
+  return {
+    status,
+    connected: status === "connected",
+    prediction,
+    disconnect,
+  }
+}

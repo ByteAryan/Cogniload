@@ -1,0 +1,221 @@
+import {
+  createContext, useCallback, useContext, useEffect,
+  useMemo, useRef, useState,
+} from "react"
+import { useAuth } from "./AuthContext"
+import { sessionAPI, behaviorAPI, predictAPI, collectorAPI } from "../services/api"
+import { useWebSocket } from "../hooks/useWebSocket"
+import { isTauri } from "../hooks/useTauri"
+
+const TrackingContext = createContext(null)
+
+const CONSENT_VERSION    = "behavioral-metrics-v1"
+const DEFAULT_FLUSH_MS   = 15_000   // 15 s — Rust collector accumulates, then we drain
+
+export function TrackingProvider({ children }) {
+  const { user, isAuth } = useAuth()
+
+  const [trackingState, setTrackingState] = useState("idle")  // idle | starting | tracking | paused | ending
+  const [consentOpen,   setConsentOpen]   = useState(false)
+  const [session,       setSession]       = useState(null)
+  const [prediction,    setPrediction]    = useState(null)
+  // Browser/.exe build: the Python collector pushes predictions server-side and the
+  // backend broadcasts them over /ws/predictions. (Tauri build uses invoke() instead.)
+  const ws = useWebSocket(isAuth && !isTauri)
+  // Fallback when the WebSocket is not connected: pick up the latest saved prediction by polling.
+  const [polledPrediction, setPolledPrediction] = useState(null)
+  const lastPredCountRef = useRef(0)
+  const [error,         setError]         = useState(null)
+  const [flushMs,       setFlushMs]       = useState(DEFAULT_FLUSH_MS)
+
+  const flushTimerRef = useRef(null)
+
+  // ── Consent ───────────────────────────────────────────────────────────────
+  const consentKey = user ? `cogniload.consent.${user.id}` : null
+  const hasConsent = Boolean(consentKey && localStorage.getItem(consentKey) === CONSENT_VERSION)
+
+  // ── Flush: drain Rust collector → SQLite → ONNX inference ────────────────
+  const flush = useCallback(async () => {
+    if (!session) return
+    try {
+      // 1. Drain collector buffer → write behavior_data row
+      const behaviorRecord = await behaviorAPI.flush(session.id)
+
+      // 2. Run ONNX inference on that payload
+      const pred = await predictAPI.predict(session.id, behaviorRecord, behaviorRecord.id)
+      setPrediction(pred)
+    } catch {
+      // offline or model not ready — silent, will retry next interval
+    }
+  }, [session])
+
+  // ── Manage flush interval ─────────────────────────────────────────────────
+  useEffect(() => {
+    if (trackingState !== "tracking") {
+      clearInterval(flushTimerRef.current)
+      return
+    }
+    clearInterval(flushTimerRef.current)
+    flushTimerRef.current = setInterval(flush, flushMs)
+    return () => clearInterval(flushTimerRef.current)
+  }, [trackingState, flush, flushMs])
+
+  // ── Collector health (HTTP mode): poll /session/current so the UI can show
+  //    whether the system-wide collector process is really running.
+  useEffect(() => {
+    if (isTauri || trackingState !== "tracking") return
+    let alive = true
+    const poll = () => sessionAPI.current()
+      .then((cur) => {
+        if (!alive || !cur) return
+        setSession((prev) => prev ? { ...prev, ...cur, id: prev.id } : prev)
+        if (cur.latest_load && cur.prediction_count !== lastPredCountRef.current) {
+          lastPredCountRef.current = cur.prediction_count
+          setPolledPrediction({
+            load_level: cur.latest_load,
+            confidence: cur.latest_confidence ?? 0,
+            session_id: cur.session_id,
+            keys_pressed: cur.keys_pressed,
+            mouse_events: cur.mouse_events,
+            typing_wpm:   cur.typing_wpm,
+          })
+        }
+      })
+      .catch(() => {})
+    const id = setInterval(poll, 5_000)
+    poll()
+    return () => { alive = false; clearInterval(id) }
+  }, [trackingState])
+
+  // ── Session actions ───────────────────────────────────────────────────────
+  const startTracking = useCallback(async () => {
+    if (!hasConsent) { setConsentOpen(true); return false }
+    setTrackingState("starting"); setError(null)
+    try {
+      const s = await sessionAPI.start()
+      // HTTP backend returns session_id; the Tauri commands return id
+      setSession({ ...s, id: s.id ?? s.session_id })
+      await collectorAPI.setEnabled(true)
+      setTrackingState("tracking")
+      return true
+    } catch (e) {
+      setTrackingState("idle")
+      setError("Unable to start session.")
+      return false
+    }
+  }, [hasConsent])
+
+  const acceptConsent = useCallback(async () => {
+    if (consentKey) localStorage.setItem(consentKey, CONSENT_VERSION)
+    setConsentOpen(false)
+    return startTracking()
+  }, [consentKey, startTracking])
+
+  const pauseTracking = useCallback(async () => {
+    if (trackingState !== "tracking") return
+    await collectorAPI.setEnabled(false)
+    setTrackingState("paused")
+  }, [trackingState])
+
+  const resumeTracking = useCallback(async () => {
+    if (trackingState !== "paused") return
+    await collectorAPI.setEnabled(true)
+    setTrackingState("tracking")
+  }, [trackingState])
+
+  const endTracking = useCallback(async () => {
+    if (!["tracking", "paused"].includes(trackingState)) return
+    setTrackingState("ending"); setError(null)
+    try {
+      clearInterval(flushTimerRef.current)
+      // Final flush before ending
+      if (session && trackingState === "tracking") await flush()
+      await collectorAPI.setEnabled(false)
+      if (session) await sessionAPI.end(session.id)
+      setSession(null)
+      setPrediction(null)
+      setPolledPrediction(null)
+      lastPredCountRef.current = 0
+      setTrackingState("idle")
+    } catch {
+      setTrackingState("paused")
+      setError("Unable to end session. Retry.")
+    }
+  }, [trackingState, session, flush])
+
+  // ── Reset on logout ───────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!isAuth) {
+      clearInterval(flushTimerRef.current)
+      setTrackingState("idle")
+      setSession(null)
+      setPrediction(null)
+      setError(null)
+      setConsentOpen(false)
+    }
+  }, [isAuth])
+
+  // Prefer the WebSocket push (has WPM + counts); fall back to the polled value.
+  const livePrediction = isTauri ? prediction : (ws.prediction ?? polledPrediction ?? prediction)
+
+  // Running totals for the session: each prediction carries only that flush window's counts.
+  const [totals, setTotals] = useState({ keys: 0, mouse: 0 })
+  const lastCountedRef = useRef(null)
+  useEffect(() => {
+    if (trackingState === "idle") {
+      lastCountedRef.current = null
+      setTotals({ keys: 0, mouse: 0 })
+    }
+  }, [trackingState])
+  useEffect(() => {
+    const p = livePrediction
+    if (!p || (p.keys_pressed == null && p.mouse_events == null)) return
+    const stamp = `${p.session_id}:${p.keys_pressed}:${p.mouse_events}:${p.confidence}:${p.load_level}`
+    if (stamp === lastCountedRef.current) return
+    lastCountedRef.current = stamp
+    setTotals((t) => ({
+      keys:  t.keys  + (p.keys_pressed  || 0),
+      mouse: t.mouse + (p.mouse_events  || 0),
+    }))
+  }, [livePrediction])
+
+  const value = useMemo(() => ({
+    trackingState,
+    session,
+    prediction: livePrediction,
+    error,
+    consentOpen,
+    // Shims for components that read these from the old WS-based context
+    websocketStatus: isTauri ? "native" : ws.status,
+    backendStatus:   "online",
+    networkOnline:   true,
+    collectorRunning: isTauri ? trackingState === "tracking" : Boolean(session?.collector_running),
+    collectorMode:   isTauri ? "native" : (session?.collector_mode ?? "system"),
+    collectorError:  isTauri ? null : (session?.collector_error ?? null),
+    quality: {
+      keyEvents:   livePrediction?.keys_pressed ?? 0,
+      mouseEvents: livePrediction?.mouse_events ?? 0,
+      totalKeys:   totals.keys,
+      totalMouse:  totals.mouse,
+      ready: trackingState === "tracking",
+    },
+    startTracking,
+    pauseTracking,
+    resumeTracking,
+    endTracking,
+    acceptConsent,
+    dismissConsent: () => setConsentOpen(false),
+    retry: () => {},
+  }), [
+    trackingState, session, prediction, livePrediction, totals, ws.status, error, consentOpen,
+    startTracking, pauseTracking, resumeTracking, endTracking, acceptConsent,
+  ])
+
+  return <TrackingContext.Provider value={value}>{children}</TrackingContext.Provider>
+}
+
+export function useTracking() {
+  const ctx = useContext(TrackingContext)
+  if (!ctx) throw new Error("useTracking must be used inside TrackingProvider")
+  return ctx
+}

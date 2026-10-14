@@ -1,0 +1,165 @@
+# ============================================================
+# Python (training scripts only — no runtime Python)
+# ============================================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+
+# ============================================================
+# Environment / Secrets
+# ============================================================
+.env
+.env.local
+.env.*.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+!.env.example
+!**/.env.example
+
+SECRET.MD
+
+
+# ============================================================
+# Database (SQLite lives in %APPDATA% at runtime, not in repo)
+# ============================================================
+*.db
+*.sqlite
+*.sqlite3
+
+
+# ============================================================
+# Logs
+# ============================================================
+*.log
+*.log.*
+logs/
+npm-debug.log*
+
+
+# ============================================================
+# ML / Data — source models (joblib) and datasets
+# ============================================================
+ml/saved_models/*.joblib
+ml/saved_models/*.pkl
+ml/saved_models/*.h5
+ml/saved_models/*.pt
+ml/saved_models/*.pth
+
+# Keep model metadata
+!ml/saved_models/meta.json
+
+# Datasets
+ml/datasets/
+ml/dataset.csv
+
+# Root-level stray model files
+*.joblib
+*.pkl
+
+
+# ============================================================
+# ONNX assets (built by scripts/convert_model.py — not committed)
+# ============================================================
+src-tauri/assets/model.onnx
+src-tauri/assets/scaler_params.json
+
+
+# ============================================================
+# Node / React / Vite
+# ============================================================
+node_modules/
+frontend/node_modules/
+
+frontend/dist/
+dist/
+
+.pnp
+.pnp.js
+
+.next/
+out/
+
+
+# ============================================================
+# Tauri / Rust
+# ============================================================
+src-tauri/target/
+src-tauri/gen/
+
+# No sidecars in pure-Rust build — directory removed
+src-tauri/sidecars/
+
+
+# ============================================================
+# Build / Packaging
+# ============================================================
+build/*
+!build/build.bat
+
+# Installer output
+installer/Output/
+
+
+# ============================================================
+# IDE
+# ============================================================
+.vscode/
+.idea/
+
+*.swp
+*.swo
+
+
+# ============================================================
+# OS
+# ============================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+
+# ============================================================
+# Testing / Coverage
+# ============================================================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+
+# ============================================================
+# Jupyter
+# ============================================================
+.ipynb_checkpoints/
+
+
+# ============================================================
+# Vercel
+# ============================================================
+.vercel
+
+
+# ============================================================
+# Legacy / Removed
+# ============================================================
+models/hand_landmarker.task
+
+# Old Python backend (deleted)
+backend/
+
+# Old sidecar runtime data (deleted)
+sidecars/
